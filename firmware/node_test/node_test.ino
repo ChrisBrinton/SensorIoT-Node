@@ -31,6 +31,7 @@
 // **********************************************************************************
 #include <RFM69.h>         //get it here: https://github.com/lowpowerlab/rfm69
 #include <RFM69_ATC.h>     //get it here: https://github.com/lowpowerlab/rfm69
+#include <RFM69_OTA.h>     //get it here: https://github.com/lowpowerlab/rfm69
 #include <SPIFlash.h>      //get it here: https://github.com/lowpowerlab/spiflash
 #include <SPI.h>           //included in Arduino IDE (www.arduino.cc)
 #include <Wire.h>          //included in Arduino IDE (www.arduino.cc)
@@ -42,8 +43,8 @@
 //************ IMPORTANT SETTINGS - YOU MUST CHANGE/CONFIGURE TO FIT YOUR HARDWARE ************
 //*********************************************************************************************
 #define GATEWAYID   1
-#define NODEID      86 //86 was the last - below 40 are test&debug nodes
-#define NETWORKID   100
+#define NODEID      9 //67 was the last - below 40 are test&debug nodes
+#define NETWORKID   101
 //#define FREQUENCY     RF69_433MHZ
 //#define FREQUENCY     RF69_868MHZ
 #define FREQUENCY       RF69_915MHZ //Match this with the version of your Moteino! (others: RF69_433MHZ, RF69_868MHZ)
@@ -60,19 +61,20 @@
 #define SLEEP_LONG SLEEP_2S
 #define SLEEP_LONGER SLEEP_4S
 #define SLEEP_LONGEST SLEEP_8S
-period_t sleepTime = SLEEP_4S; //period_t is an enum type defined in the LowPower library (LowPower.h)
+period_t sleepTime = SLEEP_1S; //period_t is an enum type defined in the LowPower library (LowPower.h)
 //*********************************************************************************************
 #define BATT_MONITOR_EN A3 //enables battery voltage divider to get a reading from a battery, disable it to save power
-#define BATT_MONITOR  A7   //The 1.4h node can read the VIN line directly due to the boost circuit that is used as a reference
+#define BATT_MONITOR  A0   //through 1Meg+470Kohm and 0.1uF cap from battery VCC - this ratio divides the voltage to bring it below 3.3V where it is scaled to a readable range
 #define BATT_CYCLES   2    //read and report battery voltage every this many sleep cycles (ex 30cycles * 8sec sleep = 240sec/4min). For 450 cyclesyou would get ~1 hour intervals
 //#define BATT_FORMULA(reading) reading * 0.00322 // >>> fine tune this parameter to match your voltage when fully charged
-#define BATT_FORMULA(reading) ((reading * 0.00437)+ .54)/1.68  // >>> Tuned for 1.4h node
+#define BATT_FORMULA(reading) reading * 0.00437 // >>> Tuned for 1.4e node
 #define BATT_LOW      3.6  //(volts)
 #define BATT_READ_LOOPS  SEND_LOOPS*10  // read and report battery voltage every this many sleep cycles (ex 30cycles * 8sec sleep = 240sec/4min). For 450 cycles you would get ~1 hour intervals between readings
 //*****************************************************************************************************************************
 //*****************************
 #define POWER_BOOST_EN 3
-#define TRANSMIT_COUNTER 150 //150*4s = 10min - multiply the transmit counter * sleep time to determine transmit interval
+#define POWER_BOOST_WDT 4
+#define TRANSMIT_COUNTER 5 //150*4s = 10min - multiply the transmit counter * sleep time to determine transmit interval
 //*****************************
 
 #ifdef __AVR_ATmega1284P__
@@ -195,12 +197,13 @@ void loop()
 
   if(readCycles > TRANSMIT_COUNTER) {
     Blink(LED, 8); // 50ma * 5ms
-    delay(2); //Dont read bat voltage for at least 10 millis (3 for enable, 5 for led blink, so 2 more here)
     readBattery(); //50ma * .35ms
     readCycles=0;
 
 
     //read BME sensor
+    DEBUGln("Reading BME280 sensor");
+    SERIALFLUSH();
     bme280.begin();
     P = bme280.readFloatPressure() * 0.0002953; //read Pa and convert to inHg
     F = bme280.readTempF();
@@ -216,6 +219,8 @@ void loop()
     sprintf(buffer, "BAT:%sv F:%s H:%s P:%s", BATstr, Fstr, Hstr, Pstr);
 
     sendLen = strlen(buffer);
+    DEBUGln("Sending Radio Packet");
+    SERIALFLUSH();
     radio.sendWithRetry(GATEWAYID, buffer, sendLen, 1); //retry one time
     DEBUG(buffer); DEBUG(" (packet length:"); DEBUG(sendLen); DEBUGln(")");
  
@@ -246,6 +251,10 @@ void disablePowerBoost()
   digitalWrite(POWER_BOOST_EN, LOW);
   pinMode(POWER_BOOST_EN, INPUT);
   DEBUGln("Power boost off");
+  pinMode(POWER_BOOST_WDT, OUTPUT);
+  digitalWrite(POWER_BOOST_WDT, HIGH);
+  pinMode(POWER_BOOST_WDT, INPUT);
+  DEBUGln("Power boost watch dog timer set");
 }
 
 void readBattery()

@@ -1,4 +1,4 @@
-//SensorIoT-node-weather is based on the low power labs Moteino and WeatherSheild R2 with subsequent changes.
+//node_prod_pwr_boost is based on the low power labs Moteino and WeatherSheild R2 with subsequent changes.
 
 // **********************************************************************************************************
 // WeatherShield R2 (BME280 sensor) sameple sketch that works with Moteinos equipped with RFM69W/RFM69HW
@@ -23,15 +23,15 @@
 // PARTICULAR PURPOSE. See the GNU General Public        
 // License for more details.                              
 //                                                        
-// Licence can be viewed at                               
+// License can be viewed at                               
 // http://www.gnu.org/licenses/gpl-3.0.txt
 //
 // Please maintain this license information along with authorship
 // and copyright notices in any redistribution of this code
 // **********************************************************************************
+#include <node_prod_pwr_boost.h>
 #include <RFM69.h>         //get it here: https://github.com/lowpowerlab/rfm69
 #include <RFM69_ATC.h>     //get it here: https://github.com/lowpowerlab/rfm69
-#include <RFM69_OTA.h>     //get it here: https://github.com/lowpowerlab/rfm69
 #include <SPIFlash.h>      //get it here: https://github.com/lowpowerlab/spiflash
 #include <SPI.h>           //included in Arduino IDE (www.arduino.cc)
 #include <Wire.h>          //included in Arduino IDE (www.arduino.cc)
@@ -42,9 +42,9 @@
 //*********************************************************************************************
 //************ IMPORTANT SETTINGS - YOU MUST CHANGE/CONFIGURE TO FIT YOUR HARDWARE ************
 //*********************************************************************************************
-#define GATEWAYID   1 //Use 1 for prod and test
-#define NODEID      57 //57 was the last
-#define NETWORKID   10 //Use 100 for prod and 101 for test
+#define GATEWAYID   1
+#define NODEID      84 //86 was the last - below 40 are test&debug nodes
+#define NETWORKID   100
 //#define FREQUENCY     RF69_433MHZ
 //#define FREQUENCY     RF69_868MHZ
 #define FREQUENCY       RF69_915MHZ //Match this with the version of your Moteino! (others: RF69_433MHZ, RF69_868MHZ)
@@ -61,18 +61,19 @@
 #define SLEEP_LONG SLEEP_2S
 #define SLEEP_LONGER SLEEP_4S
 #define SLEEP_LONGEST SLEEP_8S
-period_t sleepTime = SLEEP_LONGEST; //period_t is an enum type defined in the LowPower library (LowPower.h)
+period_t sleepTime = SLEEP_4S; //period_t is an enum type defined in the LowPower library (LowPower.h)
 //*********************************************************************************************
 #define BATT_MONITOR_EN A3 //enables battery voltage divider to get a reading from a battery, disable it to save power
-#define BATT_MONITOR  A7   //through 1Meg+470Kohm and 0.1uF cap from battery VCC - this ratio divides the voltage to bring it below 3.3V where it is scaled to a readable range
+#define BATT_MONITOR  A7   //The 1.4h node can read the VIN line directly due to the boost circuit that is used as a reference
 #define BATT_CYCLES   2    //read and report battery voltage every this many sleep cycles (ex 30cycles * 8sec sleep = 240sec/4min). For 450 cyclesyou would get ~1 hour intervals
-#define BATT_FORMULA(reading) reading * 0.00322 * 1.475  // >>> fine tune this parameter to match your voltage when fully charged
+//#define BATT_FORMULA(reading) reading * 0.00322 // >>> fine tune this parameter to match your voltage when fully charged
+#define BATT_FORMULA(reading) ((reading * 0.00437)+ .54)/1.68  // >>> Tuned for 1.4h node
 #define BATT_LOW      3.6  //(volts)
 #define BATT_READ_LOOPS  SEND_LOOPS*10  // read and report battery voltage every this many sleep cycles (ex 30cycles * 8sec sleep = 240sec/4min). For 450 cycles you would get ~1 hour intervals between readings
 //*****************************************************************************************************************************
 //*****************************
 #define POWER_BOOST_EN 3
-#define POWER_BOOST_WDT 4
+#define TRANSMIT_COUNTER 150 //150*4s = 10min - multiply the transmit counter * sleep time to determine transmit interval
 //*****************************
 
 #ifdef __AVR_ATmega1284P__
@@ -111,6 +112,8 @@ char Pstr[10];
 char Fstr[10];
 char Hstr[10];
 char buffer[50];
+int cycles,powerCycles,readCycles;
+double F,P,H;
 
 void setup(void)
 {
@@ -119,27 +122,17 @@ void setup(void)
 #endif
   pinMode(LED, OUTPUT);
 
-//Turn on the boost circuit during setup & initialization
-  DEBUGln("Turning power boost on");
-  enablePowerBoost();
-  
-  radio.initialize(FREQUENCY,NODEID,NETWORKID);
-#ifdef IS_RFM69HW
-  radio.setHighPower(); //uncomment only for RFM69HW!
-#endif
-  radio.encrypt(ENCRYPTKEY);
-
-//Auto Transmission Control - dials down transmit power to save battery (-100 is the noise floor, -90 is still pretty good)
-//For indoor nodes that are pretty static and at pretty stable temperatures (like a MotionMote) -90dBm is quite safe
-//For more variable nodes that can expect to move or experience larger temp drifts a lower margin like -70 to -80 would probably be better
-//Always test your ATC mote in the edge cases in your own environment to ensure ATC will perform as you expect
-#ifdef ENABLE_ATC
-  radio.enableAutoPower(ATC_RSSI);
-#endif
-
-  sprintf(buffer, "WeatherMote - transmitting at: %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
+  sprintf(buffer, "SensorIoT Node - Network ID %d Gateway ID %d", NETWORKID, NODEID);
   DEBUGln(buffer);
 
+  DEBUGln("Setting up device");
+
+  enablePowerBoost(); //enable the power boost circuit during setup and initialization
+
+  cycles=0;
+  powerCycles=0;
+  readCycles=0;
+  
   //initialize weather shield BME280 sensor
   bme280.settings.commInterface = I2C_MODE;
   bme280.settings.I2CAddress = 0x77;
@@ -150,26 +143,47 @@ void setup(void)
   bme280.settings.pressOverSample = 1;
   bme280.settings.humidOverSample = 1;
 
-  radio.sendWithRetry(GATEWAYID, "START", 6);
+  DEBUGln("Initializing and sleeping BME280");
+
+  
+  bme280.begin();
+  P = bme280.readFloatPressure() * 0.0002953; //read Pa and convert to inHg
+  F = bme280.readTempF();
+  H = bme280.readFloatHumidity();
+  bme280.writeRegister(BME280_CTRL_MEAS_REG, 0x00); //sleep the BME280
+  
+  
+  DEBUGln("Blinking LED");
+  
   Blink(LED, 100);Blink(LED, 100);Blink(LED, 100);
 
-  DEBUGln("Flash init");
-  if (flash.initialize()) flash.sleep();
+  DEBUGln("Initializing radio");
 
-  for (uint8_t i=0; i<=A5; i++)
-  {
-    if (i == RF69_SPI_CS) continue;
-    if (i == FLASH_SS) continue;
-    pinMode(i, OUTPUT);
-    digitalWrite(i, LOW);
-  }
   
-  readBattery();
+  radio.initialize(FREQUENCY,NODEID,NETWORKID);
+#ifdef IS_RFM69HW
+  radio.setHighPower(); //uncomment only for RFM69HW!
+#endif
+  radio.encrypt(ENCRYPTKEY);
+
+
+//Auto Transmission Control - dials down transmit power to save battery (-100 is the noise floor, -90 is still pretty good)
+//For indoor nodes that are pretty static and at pretty stable temperatures (like a MotionMote) -90dBm is quite safe
+//For more variable nodes that can expect to move or experience larger temp drifts a lower margin like -70 to -80 would probably be better
+//Always test your ATC mote in the edge cases in your own environment to ensure ATC will perform as you expect
+#ifdef ENABLE_ATC
+  radio.enableAutoPower(ATC_RSSI);
+#endif
+
+  sprintf(buffer, "Transmitting at: %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
+  DEBUGln(buffer);
+
+  radio.sleep();
   SERIALFLUSH();
 }
 
+unsigned long doorPulseCount = 0;
 char input=0;
-double F,P,H;
 byte sendLoops=0;
 byte battReadLoops=0;
 float batteryVolts = 5;
@@ -179,23 +193,21 @@ byte sendLen;
 void loop()
 {
   enablePowerBoost();
-  
-  if (battReadLoops--<=0) //only read battery every BATT_READ_LOOPS cycles
-  {
-    readBattery();
-    battReadLoops = BATT_READ_LOOPS-1;
-  }
-  
-  if (sendLoops--<=0)   //send readings every SEND_LOOPS
-  {
-    sendLoops = SEND_LOOPS-1;
-    DEBUG("Reading sensor: ");
+
+  if(readCycles > TRANSMIT_COUNTER) {
+    Blink(LED, 8); // 50ma * 5ms
+    delay(2); //Dont read bat voltage for at least 10 millis (3 for enable, 5 for led blink, so 2 more here)
+    readBattery(); //50ma * .35ms
+    readCycles=0;
+
+
     //read BME sensor
     bme280.begin();
     P = bme280.readFloatPressure() * 0.0002953; //read Pa and convert to inHg
     F = bme280.readTempF();
     H = bme280.readFloatHumidity();
     bme280.writeRegister(BME280_CTRL_MEAS_REG, 0x00); //sleep the BME280
+
 
     dtostrf(F, 3,2, Fstr);
     dtostrf(H, 3,2, Hstr);
@@ -207,26 +219,27 @@ void loop()
     sendLen = strlen(buffer);
     radio.sendWithRetry(GATEWAYID, buffer, sendLen, 1); //retry one time
     DEBUG(buffer); DEBUG(" (packet length:"); DEBUG(sendLen); DEBUGln(")");
-
-    #ifdef BLINK_EN
-      Blink(LED, 5);
-    #endif
+ 
   }
   
+  radio.sleep();
+
+  //The rest of the loop costs 10ma * 4ms
   disablePowerBoost();
   SERIALFLUSH();
-  flash.sleep();
-  radio.sleep(); //you can comment out this line if you want this node to listen for wireless programming requests
   LowPower.powerDown(sleepTime, ADC_OFF, BOD_OFF);
-  DEBUGln("WAKEUP");
+  readCycles++;
+  cycles++;
+  DEBUG(cycles);
+  DEBUGln(" WAKEUP");
 }
 
 void enablePowerBoost()
 {
   pinMode(POWER_BOOST_EN, OUTPUT);
   digitalWrite(POWER_BOOST_EN, HIGH);
-  delay(4); //Wait a few millis to let the power resevoir fill up
   DEBUGln("Power boost on");
+  delay(3); //hackey atm, but lets try holding the boost on a bit longer and see if the power stabilizes a bit
 }
 
 void disablePowerBoost()
@@ -234,10 +247,6 @@ void disablePowerBoost()
   digitalWrite(POWER_BOOST_EN, LOW);
   pinMode(POWER_BOOST_EN, INPUT);
   DEBUGln("Power boost off");
-  pinMode(POWER_BOOST_WDT, OUTPUT);
-  digitalWrite(POWER_BOOST_WDT, HIGH);
-  pinMode(POWER_BOOST_WDT, INPUT);
-  DEBUGln("Power boost watch dog timer set");
 }
 
 void readBattery()
@@ -245,18 +254,29 @@ void readBattery()
   unsigned int readings=0;
   
   //enable battery monitor on WeatherShield (via mosfet controlled by A3)
-  pinMode(BATT_MONITOR_EN, OUTPUT);
-  digitalWrite(BATT_MONITOR_EN, LOW);
+  //pinMode(BATT_MONITOR_EN, OUTPUT);
+  //digitalWrite(BATT_MONITOR_EN, LOW);
 
-  for (byte i=0; i<5; i++) //take several samples, and average
-    readings+=analogRead(BATT_MONITOR);
+  //take several samples, and average
+  for (byte i=0; i<5; i++) {
+    unsigned int reading=0;
+    reading = analogRead(BATT_MONITOR);
+    DEBUG("raw ");
+    DEBUGln(reading);
+    batteryVolts = BATT_FORMULA(reading);
+    dtostrf(batteryVolts,3,2, BATstr);
+    DEBUGln(BATstr);
+    
+    readings+=reading;
+  }
   
   //disable battery monitor
   pinMode(BATT_MONITOR_EN, INPUT); //highZ mode will allow p-mosfet to be pulled high and disconnect the voltage divider on the weather shield
     
   batteryVolts = BATT_FORMULA(readings / 5.0);
   dtostrf(batteryVolts,3,2, BATstr); //update the BATStr which gets sent every BATT_CYCLES or along with the MOTION message
-  if (batteryVolts <= BATT_LOW) BATstr = "LOW";
+  //if (batteryVolts <= BATT_LOW) BATstr = "LOW";
+  DEBUG("Average reading: ");
   DEBUGln(BATstr);
 }
 
